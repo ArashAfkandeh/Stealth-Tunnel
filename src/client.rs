@@ -31,7 +31,7 @@ async fn connect_h2_node(remote: &RemoteNode, tls_connector: &SslConnector, secr
     let tcp = TcpStream::connect(&remote.addr).await.map_err(|e| e.to_string())?;
     let _ = tcp.set_nodelay(true);
     enable_tcp_keepalive(&tcp);
-    let frag_tcp = FragmentedStream { inner: tcp, first_write: false };
+    let frag_tcp = FragmentedStream::new(tcp);
 
     let mut config = tls_connector.configure().map_err(|e| e.to_string())?;
     config.set_verify_hostname(false);
