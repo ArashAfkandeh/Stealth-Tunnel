@@ -29,7 +29,7 @@ pub async fn run_udp_proxy(
 
     // نگاشت آدرس کلاینت به سوکت محلی (که با هدف ارتباط دارد)
     let sessions: Arc<RwLock<HashMap<SocketAddr, Arc<UdpSocket>>>> = Arc::new(RwLock::new(HashMap::new()));
-    let mut buf = [0u8; 65535]; // حداکثر سایز پکت UDP
+    let mut buf = crate::buf_pool::PooledVec::new_with_size(65535); // حداکثر سایز پکت UDP
 
     info!("🚀 UDP/QUIC User-Space NAT Proxy started on {}", bind_addr);
 
@@ -101,7 +101,7 @@ pub async fn run_udp_proxy(
                             let sessions_ref = sessions.clone();
                             let public_sock_ref = public_socket.clone();
                             tokio::spawn(async move {
-                                let mut lbuf = [0u8; 65535];
+                                let mut lbuf = crate::buf_pool::PooledVec::new_with_size(65535);
                                 loop {
                                     match tokio::time::timeout(UDP_SESSION_TIMEOUT, local_sock.recv(&mut lbuf)).await {
                                         Ok(Ok(n)) => {

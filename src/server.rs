@@ -4,7 +4,6 @@ use crate::net_utils::{enable_tcp_keepalive, frame_grpc, generate_ephemeral_cert
 use crate::routing::extract_sni;
 
 use rand::Rng;
-use bytes::{Bytes};
 use http::StatusCode;
 use quinn::{ServerConfig as QuinnServerConfig, Endpoint};
 use std::{sync::Arc, time::Duration};
@@ -30,7 +29,7 @@ const PEEK_TIMEOUT_MS: u64 = 400;
 /// و چه مسیر TLS Terminate محلی انتخاب شود، همان جریان اصلی TCP بدون هیچ
 /// کپی/بازپخش دستی مصرف خواهد شد.
 async fn peek_sni(tcp: &TcpStream) -> Option<String> {
-    let mut buf = vec![0u8; PEEK_BUF_SIZE];
+    let mut buf = crate::buf_pool::PooledVec::new_with_size(PEEK_BUF_SIZE);
     let deadline = tokio::time::Instant::now() + Duration::from_millis(PEEK_TIMEOUT_MS);
     loop {
         if let Ok(n) = tcp.peek(&mut buf).await {
@@ -160,7 +159,7 @@ pub async fn run_server(cfg: ServerConfig, cancel_token: CancellationToken) {
                                     if recv_stream.read_exact(&mut head).await.is_err() { return; }
                                     let len = u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
                                     if len > 8192 { return; }
-                                    let mut payload = vec![0u8; len];
+                                    let mut payload = crate::buf_pool::PooledVec::new_with_size(len);
                                     if recv_stream.read_exact(&mut payload).await.is_err() { return; }
                                     
                                     let dec = match decrypt_payload(&cipher_in, &payload) {
@@ -197,7 +196,7 @@ pub async fn run_server(cfg: ServerConfig, cancel_token: CancellationToken) {
                                             }
                                         });
                                         
-                                        let mut grpc_buf = crate::buf_pool::PooledBytesMut::new();
+                                        let mut grpc_buf = crate::buf_pool::PooledVec::new();
                                         while let Ok(Some(chunk)) = recv_stream.read_chunk(usize::MAX, true).await {
                                             grpc_buf.extend_from_slice(&chunk.bytes);
                                             while grpc_buf.len() >= 5 {
@@ -206,7 +205,7 @@ pub async fn run_server(cfg: ServerConfig, cancel_token: CancellationToken) {
                                                 if let Ok(dec) = decrypt_payload(&cipher_in, &grpc_buf[5..5+len]) {
                                                     if target_write.write_all(&dec).await.is_err() { break; }
                                                 }
-                                                let _ = grpc_buf.split_to(5 + len);
+                                                grpc_buf.drain(0..5+len);
                                             }
                                         }
                                     }
@@ -314,7 +313,7 @@ pub async fn run_server(cfg: ServerConfig, cancel_token: CancellationToken) {
                                                     while send_stream.capacity() < framed.len() {
                                                         if let Some(Err(_)) | None = std::future::poll_fn(|cx| send_stream.poll_capacity(cx)).await { break; }
                                                     }
-                                                    if send_stream.send_data(framed, false).is_err() { break; }
+                                                    if send_stream.send_data(bytes::Bytes::copy_from_slice(&framed), false).is_err() { break; }
                                                 }
                                                 Ok(Err(_)) => break,
                                                 Err(_) => {
@@ -323,14 +322,14 @@ pub async fn run_server(cfg: ServerConfig, cancel_token: CancellationToken) {
                                                     while send_stream.capacity() < framed.len() {
                                                         if let Some(Err(_)) | None = std::future::poll_fn(|cx| send_stream.poll_capacity(cx)).await { break; }
                                                     }
-                                                    if send_stream.send_data(framed, false).is_err() { break; }
+                                                    if send_stream.send_data(bytes::Bytes::copy_from_slice(&framed), false).is_err() { break; }
                                                 }
                                             }
                                         }
-                                        let _ = send_stream.send_data(Bytes::new(), true);
+                                        let _ = send_stream.send_data(bytes::Bytes::new(), true);
                                     });
 
-                                    let mut grpc_buf = crate::buf_pool::PooledBytesMut::new();
+                                    let mut grpc_buf = crate::buf_pool::PooledVec::new();
                                     let mut body = req.into_body();
                                     while let Some(Ok(data)) = body.data().await {
                                         let _ = body.flow_control().release_capacity(data.len());
@@ -341,7 +340,7 @@ pub async fn run_server(cfg: ServerConfig, cancel_token: CancellationToken) {
                                             if let Ok(dec) = decrypt_payload(&cipher_in, &grpc_buf[5..5+len]) {
                                                 if target_write.write_all(&dec).await.is_err() { break; }
                                             }
-                                            let _ = grpc_buf.split_to(5 + len);
+                                            grpc_buf.drain(0..5+len);
                                         }
                                     }
                                 }

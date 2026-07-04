@@ -1,4 +1,4 @@
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use rand::Rng;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
@@ -73,11 +73,11 @@ pub fn enable_tcp_keepalive(stream: &TcpStream) {
 }
 
 pub fn frame_grpc(data: &[u8]) -> Bytes {
-    let mut buf = BytesMut::with_capacity(5 + data.len());
-    buf.extend_from_slice(&[0]);
+    let mut buf = crate::buf_pool::PooledVec::new();
+    buf.push(0);
     buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
     buf.extend_from_slice(data);
-    buf.freeze()
+    Bytes::copy_from_slice(&buf)
 }
 
 /// یک گواهی خود-امضا (Self-Signed) و کلید خصوصی موقت و صرفاً در حافظه

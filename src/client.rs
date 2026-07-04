@@ -6,7 +6,6 @@ use crate::routing::{extract_sni, parse_port_mappings};
 
 use rand::Rng;
 use boring::ssl::{SslConnector, SslMethod, SslOptions, SslVerifyMode};
-use bytes::{Bytes};
 use http::{Method, Request};
 use quinn::{ClientConfig as QuinnClientConfig, Endpoint};
 use std::{
@@ -24,11 +23,11 @@ use tracing::{debug, error, info, trace, warn};
 
 #[derive(Clone)]
 enum ClientPoolItem {
-    H2(h2::client::SendRequest<Bytes>),
+    H2(h2::client::SendRequest<bytes::Bytes>),
     Quic(quinn::Connection),
 }
 
-async fn connect_h2_node(remote: &RemoteNode, tls_connector: &SslConnector, secret: &str) -> Result<h2::client::SendRequest<Bytes>, String> {
+async fn connect_h2_node(remote: &RemoteNode, tls_connector: &SslConnector, secret: &str) -> Result<h2::client::SendRequest<bytes::Bytes>, String> {
     let tcp = TcpStream::connect(&remote.addr).await.map_err(|e| e.to_string())?;
     let _ = tcp.set_nodelay(true);
     enable_tcp_keepalive(&tcp);
@@ -218,7 +217,8 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                         if let Ok((mut send_stream, mut recv_stream)) = conn.open_bi().await {
                                             // ارسال آدرس مقصد در بستر امن QUIC
                                             let target_bytes = target_up.as_bytes();
-                                            let mut initial_payload = vec![target_bytes.len() as u8];
+                                            let mut initial_payload = crate::buf_pool::PooledVec::new();
+                                            initial_payload.push(target_bytes.len() as u8);
                                             initial_payload.extend_from_slice(target_bytes);
                                             let enc_initial = encrypt_payload(&cipher_out, &initial_payload);
                                             let framed = frame_grpc(&enc_initial);
@@ -243,7 +243,7 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                                 }
                                             });
                                             
-                                            let mut grpc_buf = crate::buf_pool::PooledBytesMut::new();
+                                            let mut grpc_buf = crate::buf_pool::PooledVec::new();
                                             while let Ok(Some(chunk)) = recv_stream.read_chunk(usize::MAX, true).await {
                                                 grpc_buf.extend_from_slice(&chunk.bytes);
                                                 while grpc_buf.len() >= 5 {
@@ -252,7 +252,7 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                                     if let Ok(dec) = decrypt_payload(&cipher_in, &grpc_buf[5..5+len]) {
                                                         if local_write.write_all(&dec).await.is_err() { break; }
                                                     }
-                                                    let _ = grpc_buf.split_to(5 + len);
+                                                    grpc_buf.drain(0..5+len);
                                                 }
                                             }
                                         }
@@ -282,7 +282,7 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                                         while send_stream.capacity() < framed.len() {
                                                             if let Some(Err(_)) | None = std::future::poll_fn(|cx| send_stream.poll_capacity(cx)).await { break; }
                                                         }
-                                                        if send_stream.send_data(framed, false).is_err() { break; }
+                                                        if send_stream.send_data(bytes::Bytes::copy_from_slice(&framed), false).is_err() { break; }
                                                     }
                                                     Ok(Err(_)) => break,
                                                     Err(_) => {
@@ -291,14 +291,14 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                                         while send_stream.capacity() < framed.len() {
                                                             if let Some(Err(_)) | None = std::future::poll_fn(|cx| send_stream.poll_capacity(cx)).await { break; }
                                                         }
-                                                        if send_stream.send_data(framed, false).is_err() { break; }
+                                                        if send_stream.send_data(bytes::Bytes::copy_from_slice(&framed), false).is_err() { break; }
                                                     }
                                                 }
                                             }
-                                            let _ = send_stream.send_data(Bytes::new(), true);
+                                            let _ = send_stream.send_data(bytes::Bytes::new(), true);
                                         });
 
-                                        let mut grpc_buf = crate::buf_pool::PooledBytesMut::new();
+                                        let mut grpc_buf = crate::buf_pool::PooledVec::new();
                                         if let Ok(res) = response.await {
                                             let mut body = res.into_body();
                                             while let Some(Ok(data)) = body.data().await {
@@ -310,7 +310,7 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                                     if let Ok(dec) = decrypt_payload(&cipher_in, &grpc_buf[5..5+len]) {
                                                         if local_write.write_all(&dec).await.is_err() { break; }
                                                     }
-                                                    let _ = grpc_buf.split_to(5 + len);
+                                                    grpc_buf.drain(0..5+len);
                                                 }
                                             }
                                         }

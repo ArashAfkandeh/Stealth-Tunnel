@@ -1,8 +1,7 @@
 use aes_gcm::{
-    aead::{Aead, AeadCore, AeadInPlace, KeyInit, OsRng},
+    aead::{AeadCore, AeadInPlace, KeyInit, OsRng},
     Aes256Gcm, Key,
 };
-use bytes::{Bytes, BytesMut};
 use hmac::{Hmac, Mac};
 use rand::Rng;
 use sha2::{Digest, Sha256};
@@ -23,9 +22,8 @@ pub fn derive_cipher(secret: &str) -> Aes256Gcm {
     Aes256Gcm::new(&key)
 }
 
-pub fn encrypt_payload(cipher: &Aes256Gcm, data: &[u8]) -> Bytes {
+pub fn encrypt_payload(cipher: &Aes256Gcm, data: &[u8]) -> crate::buf_pool::PooledVec {
     let mut rng = rand::thread_rng();
-
     // Parrot Strategy: Mimic WebRTC/YouTube packet sizes
     let r: u8 = rng.gen_range(0..100);
     let target_size = if r < 70 {
@@ -57,25 +55,28 @@ pub fn encrypt_payload(cipher: &Aes256Gcm, data: &[u8]) -> Bytes {
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
     cipher.encrypt_in_place(&nonce, b"", &mut plaintext).unwrap();
     
-    let mut final_payload = BytesMut::with_capacity(12 + plaintext.len());
+    let mut final_payload = crate::buf_pool::PooledVec::new();
     final_payload.extend_from_slice(&nonce);
     final_payload.extend_from_slice(&plaintext);
     
     return_vec(plaintext);
-    final_payload.freeze()
+    final_payload
 }
 
-pub fn decrypt_payload(cipher: &Aes256Gcm, data: &[u8]) -> Result<Vec<u8>, &'static str> {
+pub fn decrypt_payload(cipher: &Aes256Gcm, data: &[u8]) -> Result<crate::buf_pool::PooledVec, &'static str> {
     if data.len() < 12 { return Err("Payload too short"); }
     let (nonce, ciphertext) = data.split_at(12);
 
-    let plaintext = cipher.decrypt(nonce.into(), ciphertext).map_err(|_| "Decryption failed")?;
+    let mut plaintext = crate::buf_pool::PooledVec::new();
+    plaintext.extend_from_slice(ciphertext);
+    cipher.decrypt_in_place(nonce.into(), b"", &mut *plaintext).map_err(|_| "Decryption failed")?;
     if plaintext.len() < 2 { return Err("Plaintext too short"); }
 
     let pad_len = u16::from_be_bytes([plaintext[0], plaintext[1]]) as usize;
     if plaintext.len() < 2 + pad_len { return Err("Invalid padding"); }
 
-    Ok(plaintext[2 + pad_len..].to_vec())
+    plaintext.drain(0..(2 + pad_len));
+    Ok(plaintext)
 }
 
 // ==========================================
