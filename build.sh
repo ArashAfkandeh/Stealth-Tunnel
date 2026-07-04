@@ -10,18 +10,23 @@ if command -v apt-get &> /dev/null; then
     echo "🔧 Installing native build dependencies (g++, cmake, golang, etc.)..."
     apt-get update
     # نصب نسخه‌های استاندارد ابزارهای کامپایل به جای musl
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -q -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" build-essential cmake golang clang pkg-config libssl-dev g++ 
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -q -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" build-essential cmake golang clang pkg-config libssl-dev g++ git ninja-build curl
 elif command -v dnf &> /dev/null; then
-    dnf install -y gcc-c++ cmake golang clang pkgconf-pkg-config openssl-devel
+    echo "🔧 Installing native build dependencies (gcc-c++, cmake, golang, etc.)..."
+    dnf install -y gcc-c++ cmake golang clang pkgconf-pkg-config openssl-devel git ninja-build curl
+elif command -v pacman &> /dev/null; then
+    echo "🔧 Installing native build dependencies for Arch Linux..."
+    pacman -Sy --noconfirm base-devel cmake go clang pkgconf openssl git ninja curl
 fi
 
-# 2. بررسی نصب بودن Rust
+# 2. بررسی و نصب خودکار Rust
 if ! command -v cargo &> /dev/null; then
     if [ -f "$HOME/.cargo/env" ]; then
         source "$HOME/.cargo/env" || . "$HOME/.cargo/env"
     else
-        echo "❌ Cargo is missing. Please install Rust (https://rustup.rs/)."
-        exit 1
+        echo "🦀 Cargo is missing. Installing Rust automatically..."
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        source "$HOME/.cargo/env" || . "$HOME/.cargo/env"
     fi
 fi
 

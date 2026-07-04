@@ -1,13 +1,14 @@
 use aes_gcm::{
-    aead::{Aead, AeadCore, KeyInit, OsRng},
+    aead::{Aead, AeadCore, AeadInPlace, KeyInit, OsRng},
     Aes256Gcm, Key,
 };
 use bytes::{Bytes, BytesMut};
 use hmac::{Hmac, Mac};
 use rand::Rng;
-use rand_distr::{Distribution, Normal};
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::buf_pool::{get_vec, return_vec};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -23,23 +24,44 @@ pub fn derive_cipher(secret: &str) -> Aes256Gcm {
 }
 
 pub fn encrypt_payload(cipher: &Aes256Gcm, data: &[u8]) -> Bytes {
-    let normal = Normal::new(128.0, 64.0).unwrap();
-    let pad_len = (normal.sample(&mut rand::thread_rng()) as i32).clamp(16, 512) as u16;
+    let mut rng = rand::thread_rng();
 
-    let mut padding = vec![0u8; pad_len as usize];
-    rand::thread_rng().fill(&mut padding[..]);
+    // Parrot Strategy: Mimic WebRTC/YouTube packet sizes
+    let r: u8 = rng.gen_range(0..100);
+    let target_size = if r < 70 {
+        rng.gen_range(1250..=1350) // Video frames
+    } else if r < 80 {
+        rng.gen_range(800..=1200)  // Medium frames
+    } else if r < 90 {
+        rng.gen_range(200..=300)   // Audio frames
+    } else {
+        rng.gen_range(50..=150)    // Control / ACKs
+    };
 
-    let mut plaintext = Vec::with_capacity(2 + padding.len() + data.len());
+    let min_overhead = 30; // 2 (len) + 12 (nonce) + 16 (tag)
+    let current_size = data.len() + min_overhead;
+
+    let pad_len = if current_size >= target_size {
+        rng.gen_range(16..=64) as u16
+    } else {
+        (target_size - current_size) as u16
+    };
+
+    let mut plaintext = get_vec();
     plaintext.extend_from_slice(&pad_len.to_be_bytes());
-    plaintext.extend_from_slice(&padding);
+    let current_len = plaintext.len();
+    plaintext.resize(current_len + pad_len as usize, 0);
+    rng.fill(&mut plaintext[current_len..]);
     plaintext.extend_from_slice(data);
 
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-    let ciphertext = cipher.encrypt(&nonce, plaintext.as_ref()).unwrap();
-
-    let mut final_payload = BytesMut::with_capacity(12 + ciphertext.len());
+    cipher.encrypt_in_place(&nonce, b"", &mut plaintext).unwrap();
+    
+    let mut final_payload = BytesMut::with_capacity(12 + plaintext.len());
     final_payload.extend_from_slice(&nonce);
-    final_payload.extend_from_slice(&ciphertext);
+    final_payload.extend_from_slice(&plaintext);
+    
+    return_vec(plaintext);
     final_payload.freeze()
 }
 

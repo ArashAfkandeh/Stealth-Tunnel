@@ -3,7 +3,8 @@ use crate::crypto::{decrypt_payload, derive_cipher, encrypt_payload, is_authoriz
 use crate::net_utils::{enable_tcp_keepalive, frame_grpc, generate_ephemeral_cert, get_random_headers};
 use crate::routing::extract_sni;
 
-use bytes::{Bytes, BytesMut};
+use rand::Rng;
+use bytes::{Bytes};
 use http::StatusCode;
 use quinn::{ServerConfig as QuinnServerConfig, Endpoint};
 use std::{sync::Arc, time::Duration};
@@ -13,6 +14,10 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+
+use std::net::IpAddr;
+use std::collections::HashMap;
+use tokio::sync::RwLock;
 
 // حداکثر بایتی که برای استخراج ClientHello/SNI با peek() بررسی می‌شود
 const PEEK_BUF_SIZE: usize = 8192;
@@ -61,6 +66,7 @@ async fn splice_to_real_target(mut client_tcp: TcpStream, target_addr: &str) {
 
 pub async fn run_server(cfg: ServerConfig, cancel_token: CancellationToken) {
     let cipher = Arc::new(derive_cipher(&cfg.secret));
+    let authorized_ips: Arc<RwLock<HashMap<IpAddr, tokio::time::Instant>>> = Arc::new(RwLock::new(HashMap::new()));
 
     // ============================
     // گواهی موقت (Ephemeral Self-Signed Certificate)
@@ -94,7 +100,7 @@ pub async fn run_server(cfg: ServerConfig, cancel_token: CancellationToken) {
     let listener = TcpListener::bind(&cfg.bind_addr).await.unwrap();
     
     // ============================
-    // 2. UDP Server (QUIC Tunneling)
+    // 2. UDP Server (QUIC Tunneling with User-Space NAT Proxy)
     // ============================
     let mut quic_crypto = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -103,14 +109,35 @@ pub async fn run_server(cfg: ServerConfig, cancel_token: CancellationToken) {
     quic_crypto.alpn_protocols = vec![b"h3".to_vec()]; // تظاهر به HTTP/3 برای فرار از سیستم فیلترینگ
     
     let quic_config = QuinnServerConfig::with_crypto(Arc::new(quinn::crypto::rustls::QuicServerConfig::try_from(quic_crypto).unwrap()));
-    let quic_endpoint = Endpoint::server(quic_config, cfg.bind_addr.parse().unwrap()).unwrap();
+    // بایند کردن quinn به یک پورت لوکال تصادفی
+    let local_quic_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let quic_endpoint = Endpoint::server(quic_config, local_quic_addr).unwrap();
+    let actual_local_quic_addr = quic_endpoint.local_addr().unwrap();
 
     let fallback_camo = cfg.reality_fallback_url.as_deref()
         .and_then(|u| u.trim_start_matches("https://").trim_start_matches("http://").split('/').next())
         .unwrap_or("www.ubuntu.com");
     let print_target = cfg.reality_target_addr.as_deref().unwrap_or(fallback_camo);
+    let reality_target_addr = cfg.reality_target_addr.clone().unwrap_or_else(|| format!("{}:443", print_target));
+    
     info!("🛡️ TCP & QUIC (UDP) Server listening concurrently on {} (REALITY-style L4 splice active, target={})", cfg.bind_addr, print_target);
-    warn!("ℹ️ توجه: مسیر UDP/QUIC فعلاً به Splice خام لایه ۴ مجهز نیست (محدودیت شناخته‌شده — به README مراجعه کنید).");
+    info!("ℹ️ UDP/QUIC traffic is now protected by TCP-first IP Authorization & User-Space NAT Proxy.");
+
+    // اسپاون کردن پراکسی UDP
+    let udp_bind_addr = cfg.bind_addr.clone();
+    let udp_auth_ips = authorized_ips.clone();
+    let udp_cancel_token = cancel_token.clone();
+    let udp_reality_target = reality_target_addr.clone();
+    
+    tokio::spawn(async move {
+        crate::udp_proxy::run_udp_proxy(
+            udp_bind_addr,
+            actual_local_quic_addr,
+            udp_reality_target,
+            udp_auth_ips,
+            udp_cancel_token,
+        ).await;
+    });
 
     // اسپاون کردن روتین QUIC (کاملاً مستقل از TCP)
     let cancel_quic = cancel_token.clone();
@@ -151,19 +178,28 @@ pub async fn run_server(cfg: ServerConfig, cancel_token: CancellationToken) {
                                         let (mut target_read, mut target_write) = target_tcp.into_split();
                                         
                                         tokio::spawn(async move {
-                                            let mut buf = [0u8; 8192];
-                                            while let Ok(n) = target_read.read(&mut buf).await {
-                                                if n == 0 { break; }
-                                                let framed = frame_grpc(&encrypt_payload(&cipher_out, &buf[..n]));
-                                                if send_stream.write_all(&framed).await.is_err() { break; }
+                                            let mut buf = crate::buf_pool::PooledVec::new_with_size(8192);
+                                            loop {
+                                                let timeout_dur = std::time::Duration::from_millis(rand::thread_rng().gen_range(20..50));
+                                                match tokio::time::timeout(timeout_dur, target_read.read(&mut buf)).await {
+                                                    Ok(Ok(0)) => break,
+                                                    Ok(Ok(n)) => {
+                                                        let framed = frame_grpc(&encrypt_payload(&cipher_out, &buf[..n]));
+                                                        if send_stream.write_all(&framed).await.is_err() { break; }
+                                                    }
+                                                    Ok(Err(_)) => break,
+                                                    Err(_) => {
+                                                        // Timeout -> Send Dummy Packet
+                                                        let framed = frame_grpc(&encrypt_payload(&cipher_out, &[]));
+                                                        if send_stream.write_all(&framed).await.is_err() { break; }
+                                                    }
+                                                }
                                             }
                                         });
                                         
-                                        let mut buf = [0u8; 8192];
-                                        let mut grpc_buf = BytesMut::new();
-                                        while let Ok(Some(n)) = recv_stream.read(&mut buf).await {
-                                            if n == 0 { break; }
-                                            grpc_buf.extend_from_slice(&buf[..n]);
+                                        let mut grpc_buf = crate::buf_pool::PooledBytesMut::new();
+                                        while let Ok(Some(chunk)) = recv_stream.read_chunk(usize::MAX, true).await {
+                                            grpc_buf.extend_from_slice(&chunk.bytes);
                                             while grpc_buf.len() >= 5 {
                                                 let len = u32::from_be_bytes([grpc_buf[1], grpc_buf[2], grpc_buf[3], grpc_buf[4]]) as usize;
                                                 if grpc_buf.len() < 5 + len { break; }
@@ -209,6 +245,7 @@ pub async fn run_server(cfg: ServerConfig, cancel_token: CancellationToken) {
                     });
                     let cipher_in = cipher.clone();
                     let cipher_out = cipher.clone();
+                    let authorized_ips = authorized_ips.clone();
 
                     tokio::spawn(async move {
                         // ==========================================
@@ -234,6 +271,9 @@ pub async fn run_server(cfg: ServerConfig, cancel_token: CancellationToken) {
                         }
 
                         debug!("[{}] ✅ REALITY auth OK via camouflage SNI → local tunnel termination", peer);
+                        // ذخیره IP برای اجازه عبور ترافیک UDP (QUIC)
+                        authorized_ips.write().await.insert(peer.ip(), tokio::time::Instant::now());
+
                         let tls_stream = match acceptor.accept(tcp).await { Ok(s) => s, Err(_) => return };
                         let mut h2 = match h2::server::handshake(tls_stream).await { Ok(h) => h, Err(_) => return };
 
@@ -263,20 +303,34 @@ pub async fn run_server(cfg: ServerConfig, cancel_token: CancellationToken) {
                                     let (mut target_read, mut target_write) = target_tcp.into_split();
 
                                     tokio::spawn(async move {
-                                        let mut buf = [0u8; 8192];
-                                        while let Ok(n) = target_read.read(&mut buf).await {
-                                            if n == 0 { break; }
-                                            let framed = frame_grpc(&encrypt_payload(&cipher_out, &buf[..n]));
-                                            send_stream.reserve_capacity(framed.len());
-                                            while send_stream.capacity() < framed.len() {
-                                                if let Some(Err(_)) | None = std::future::poll_fn(|cx| send_stream.poll_capacity(cx)).await { break; }
+                                        let mut buf = crate::buf_pool::PooledVec::new_with_size(8192);
+                                        loop {
+                                            let timeout_dur = std::time::Duration::from_millis(rand::thread_rng().gen_range(20..50));
+                                            match tokio::time::timeout(timeout_dur, target_read.read(&mut buf)).await {
+                                                Ok(Ok(0)) => break,
+                                                Ok(Ok(n)) => {
+                                                    let framed = frame_grpc(&encrypt_payload(&cipher_out, &buf[..n]));
+                                                    send_stream.reserve_capacity(framed.len());
+                                                    while send_stream.capacity() < framed.len() {
+                                                        if let Some(Err(_)) | None = std::future::poll_fn(|cx| send_stream.poll_capacity(cx)).await { break; }
+                                                    }
+                                                    if send_stream.send_data(framed, false).is_err() { break; }
+                                                }
+                                                Ok(Err(_)) => break,
+                                                Err(_) => {
+                                                    let framed = frame_grpc(&encrypt_payload(&cipher_out, &[]));
+                                                    send_stream.reserve_capacity(framed.len());
+                                                    while send_stream.capacity() < framed.len() {
+                                                        if let Some(Err(_)) | None = std::future::poll_fn(|cx| send_stream.poll_capacity(cx)).await { break; }
+                                                    }
+                                                    if send_stream.send_data(framed, false).is_err() { break; }
+                                                }
                                             }
-                                            if send_stream.send_data(framed, false).is_err() { break; }
                                         }
                                         let _ = send_stream.send_data(Bytes::new(), true);
                                     });
 
-                                    let mut grpc_buf = BytesMut::new();
+                                    let mut grpc_buf = crate::buf_pool::PooledBytesMut::new();
                                     let mut body = req.into_body();
                                     while let Some(Ok(data)) = body.data().await {
                                         let _ = body.flow_control().release_capacity(data.len());

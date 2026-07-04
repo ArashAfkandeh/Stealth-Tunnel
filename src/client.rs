@@ -4,8 +4,9 @@ use crate::fragment::FragmentedStream;
 use crate::net_utils::{enable_tcp_keepalive, frame_grpc, get_random_headers};
 use crate::routing::{extract_sni, parse_port_mappings};
 
+use rand::Rng;
 use boring::ssl::{SslConnector, SslMethod, SslOptions, SslVerifyMode};
-use bytes::{Bytes, BytesMut};
+use bytes::{Bytes};
 use http::{Method, Request};
 use quinn::{ClientConfig as QuinnClientConfig, Endpoint};
 use std::{
@@ -224,19 +225,27 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                             if send_stream.write_all(&framed).await.is_err() { return; }
                                             
                                             tokio::spawn(async move {
-                                                let mut buf = [0u8; 8192];
-                                                while let Ok(n) = local_read.read(&mut buf).await {
-                                                    if n == 0 { break; }
-                                                    let framed = frame_grpc(&encrypt_payload(&cipher_out, &buf[..n]));
-                                                    if send_stream.write_all(&framed).await.is_err() { break; }
+                                                let mut buf = crate::buf_pool::PooledVec::new_with_size(8192);
+                                                loop {
+                                                    let timeout_dur = std::time::Duration::from_millis(rand::thread_rng().gen_range(20..50));
+                                                    match tokio::time::timeout(timeout_dur, local_read.read(&mut buf)).await {
+                                                        Ok(Ok(0)) => break,
+                                                        Ok(Ok(n)) => {
+                                                            let framed = frame_grpc(&encrypt_payload(&cipher_out, &buf[..n]));
+                                                            if send_stream.write_all(&framed).await.is_err() { break; }
+                                                        }
+                                                        Ok(Err(_)) => break,
+                                                        Err(_) => {
+                                                            let framed = frame_grpc(&encrypt_payload(&cipher_out, &[]));
+                                                            if send_stream.write_all(&framed).await.is_err() { break; }
+                                                        }
+                                                    }
                                                 }
                                             });
                                             
-                                            let mut grpc_buf = BytesMut::new();
-                                            let mut buf = [0u8; 8192];
-                                            while let Ok(Some(n)) = recv_stream.read(&mut buf).await {
-                                                if n == 0 { break; }
-                                                grpc_buf.extend_from_slice(&buf[..n]);
+                                            let mut grpc_buf = crate::buf_pool::PooledBytesMut::new();
+                                            while let Ok(Some(chunk)) = recv_stream.read_chunk(usize::MAX, true).await {
+                                                grpc_buf.extend_from_slice(&chunk.bytes);
                                                 while grpc_buf.len() >= 5 {
                                                     let len = u32::from_be_bytes([grpc_buf[1], grpc_buf[2], grpc_buf[3], grpc_buf[4]]) as usize;
                                                     if grpc_buf.len() < 5 + len { break; }
@@ -262,20 +271,34 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
                                         };
 
                                         tokio::spawn(async move {
-                                            let mut buf = [0u8; 8192];
-                                            while let Ok(n) = local_read.read(&mut buf).await {
-                                                if n == 0 { break; }
-                                                let framed = frame_grpc(&encrypt_payload(&cipher_out, &buf[..n]));
-                                                send_stream.reserve_capacity(framed.len());
-                                                while send_stream.capacity() < framed.len() {
-                                                    if let Some(Err(_)) | None = std::future::poll_fn(|cx| send_stream.poll_capacity(cx)).await { break; }
+                                            let mut buf = crate::buf_pool::PooledVec::new_with_size(8192);
+                                            loop {
+                                                let timeout_dur = std::time::Duration::from_millis(rand::thread_rng().gen_range(20..50));
+                                                match tokio::time::timeout(timeout_dur, local_read.read(&mut buf)).await {
+                                                    Ok(Ok(0)) => break,
+                                                    Ok(Ok(n)) => {
+                                                        let framed = frame_grpc(&encrypt_payload(&cipher_out, &buf[..n]));
+                                                        send_stream.reserve_capacity(framed.len());
+                                                        while send_stream.capacity() < framed.len() {
+                                                            if let Some(Err(_)) | None = std::future::poll_fn(|cx| send_stream.poll_capacity(cx)).await { break; }
+                                                        }
+                                                        if send_stream.send_data(framed, false).is_err() { break; }
+                                                    }
+                                                    Ok(Err(_)) => break,
+                                                    Err(_) => {
+                                                        let framed = frame_grpc(&encrypt_payload(&cipher_out, &[]));
+                                                        send_stream.reserve_capacity(framed.len());
+                                                        while send_stream.capacity() < framed.len() {
+                                                            if let Some(Err(_)) | None = std::future::poll_fn(|cx| send_stream.poll_capacity(cx)).await { break; }
+                                                        }
+                                                        if send_stream.send_data(framed, false).is_err() { break; }
+                                                    }
                                                 }
-                                                if send_stream.send_data(framed, false).is_err() { break; }
                                             }
                                             let _ = send_stream.send_data(Bytes::new(), true);
                                         });
 
-                                        let mut grpc_buf = BytesMut::new();
+                                        let mut grpc_buf = crate::buf_pool::PooledBytesMut::new();
                                         if let Ok(res) = response.await {
                                             let mut body = res.into_body();
                                             while let Some(Ok(data)) = body.data().await {

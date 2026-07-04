@@ -5,6 +5,8 @@ mod fragment;
 mod net_utils;
 mod routing;
 mod server;
+mod udp_proxy;
+mod buf_pool;
 
 use client::run_client;
 use config::AppConfig;
