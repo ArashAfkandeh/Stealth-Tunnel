@@ -1,45 +1,40 @@
 #!/bin/bash
 set -e
+echo "🚀 Starting Enterprise Build Process (Native/Dynamic GNU)..."
 
-echo "🚀 Starting Enterprise Build Process..."
+# وارد شدن به پوشه صحیح پروژه (جلوگیری از اجرای نسخه قبلی اسکریپت)
+cd "$(dirname "$0")"
 
-cd /root/tunnel
-
-# 1. بررسی و نصب پیش‌نیازهای سیستم‌عامل برای کامپایل استاتیک (musl)
-if ! command -v x86_64-linux-musl-gcc &> /dev/null; then
-    echo "🔧 'musl-gcc' not found. Attempting to install 'musl-tools'..."
-    if command -v apt-get &> /dev/null; then
-        apt-get update
-        apt-get install -y musl-tools build-essential
-    elif command -v dnf &> /dev/null; then
-        dnf install -y musl-gcc
-    elif command -v pacman &> /dev/null; then
-        pacman -S --noconfirm musl
-    else
-        echo "❌ Cannot install musl-tools automatically. Please install it manually."
-        exit 1
-    fi
+# 1. نصب پیش‌نیازهای کامپایل BoringSSL روی لینوکس استاندارد (Glibc)
+if command -v apt-get &> /dev/null; then
+    echo "🔧 Installing native build dependencies (g++, cmake, golang, etc.)..."
+    apt-get update
+    # نصب نسخه‌های استاندارد ابزارهای کامپایل به جای musl
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -q -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" build-essential cmake golang clang pkg-config libssl-dev g++ 
+elif command -v dnf &> /dev/null; then
+    dnf install -y gcc-c++ cmake golang clang pkgconf-pkg-config openssl-devel
 fi
 
 # 2. بررسی نصب بودن Rust
 if ! command -v cargo &> /dev/null; then
-    echo "❌ Cargo not found. Please install Rust (https://rustup.rs/)."
-    exit 1
+    if [ -f "$HOME/.cargo/env" ]; then
+        source "$HOME/.cargo/env" || . "$HOME/.cargo/env"
+    else
+        echo "❌ Cargo is missing. Please install Rust (https://rustup.rs/)."
+        exit 1
+    fi
 fi
 
-# 3. اضافه کردن تارگت musl
-echo "📦 Adding x86_64-unknown-linux-musl target..."
-rustup target add x86_64-unknown-linux-musl
+# 3. کامپایل نسخه Release (حذف تارگت musl برای حل مشکل boring-sys)
+# توجه: به دلیل پیچیدگی‌های BoringSSL، بیلد به صورت داینامیک روی لینوکس انجام می‌شود.
+echo "⚙️ Building the binary natively (This may take a few minutes)..."
+cargo build --release
 
-# 4. کامپایل نسخه Release
-echo "⚙️ Building the binary (This may take a few minutes while compiling C/ASM crypto routines)..."
-cargo build --release --target x86_64-unknown-linux-musl
-
-# 5. استخراج و فشرده‌سازی باینری
+# 4. استخراج و فشرده‌سازی باینری
 echo "📂 Moving and stripping the binary..."
 mkdir -p ./release_bin
-cp target/x86_64-unknown-linux-musl/release/stealth_tunnel ./release_bin/
-strip ./release_bin/stealth_tunnel # کاهش حجم فایل خروجی با حذف دیباگ‌سیمبل‌ها
+cp target/release/stealth_tunnel ./release_bin/
+strip ./release_bin/stealth_tunnel || true # کاهش حجم فایل خروجی
 
 echo "✅ Build Completed Successfully!"
 echo "📁 Binary is located at: ./release_bin/stealth_tunnel"

@@ -1,19 +1,7 @@
-mode = "server"
-
 [server]
-# آدرس و پورتی که سرور روی آن گوش می‌دهد. (بهتر است 443 باشد تا شبیه ترافیک عادی HTTPS به نظر برسد)
 bind_addr = "0.0.0.0:443"
-
-# رمز عبور شما برای رمزنگاری درون‌کپسولی (باید طولانی، پیچیده و بین کلاینت و سرور یکسان باشد)
 secret = "My_Super_Enterprise_Secret_Key_2026!"
-
-# مسیر مخفی تانل شما. باید کاملاً شبیه APIهای رایج باشد تا شک‌برانگیز نشود
-hidden_path = "/api/v3/sync/data"
-
-# مسیر فایل‌های گواهینامه TLS (الزامی برای HTTP/2). باید یک گواهینامه معتبر (مثلاً Let's Encrypt) برای دامنه خود بگیرید
+hidden_path = "/api/v4/telemetry"
 tls_cert = "/etc/letsencrypt/live/app.yourdomain.com/fullchain.pem"
 tls_key = "/etc/letsencrypt/live/app.yourdomain.com/privkey.pem"
-
-# تکنیک REALITY (سپر دفاعی): اگر ربات‌های فیلترینگ IP شما را اسکن کنند،
-# محتوای این سایت معتبر برای آن‌ها بارگیری و نمایش داده می‌شود تا فکر کنند سرور شما یک سایت معمولی است.
 reality_fallback_url = "https://www.ubuntu.com"

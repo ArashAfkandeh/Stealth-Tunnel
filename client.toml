@@ -1,25 +1,20 @@
-mode = "client"
-
 [client]
-# پورتی که کلاینت روی سیستم شما باز می‌کند. (برنامه‌های دیگر مثل v2ray یا مرورگر باید به این پورت وصل شوند)
-local_proxy_addr = "127.0.0.1:1080"
-
-# آی‌پی واقعی سرور خارج شما به همراه پورت (بدون نام دامنه)
-remote_server_ip = "198.51.100.25:443"
-
-# ویژگی Domain Fronting: دامنه‌ی یک سایت کاملاً مجاز و بدون فیلتر که از کلودفلر/CDN استفاده می‌کند 
-# تا سیستم فیلترینگ با دیدن آن در SNI فریب بخورد (مثلاً سایت‌های تست سرعت یا آپدیت)
-sni_frontend = "www.speedtest.net"
-
-# هدر Host: دامنه‌ی واقعی شما که روی سرورتان تنظیم کرده‌اید و گواهینامه دارد
-host_backend = "app.yourdomain.com"
-
-# باید دقیقاً با مقدار سرور یکسان باشد
-hidden_path = "/api/v3/sync/data"
-
-# باید دقیقاً با رمز سرور یکسان باشد
+# بهترین مقادیر حرفه‌ای برای مخفی‌سازی شامل API‌های رایج تله‌متری و سینک است
+hidden_path = "/api/v4/telemetry"
 secret = "My_Super_Enterprise_Secret_Key_2026!"
+port_mappings = [
+    "1080=127.0.0.1:8443" # هدایت ترافیک پورت 1080 به بک‌اند اصلی
+]
+# pool_size_per_node = 5 (پیش‌فرض 5 است در صورت عدم وجود)
 
-# ترافیک پس از رسیدن به سرور خارج، باید به کجا تحویل داده شود؟
-# مثال: "1.1.1.1:80" (برای یک تست ساده) یا "127.0.0.1:8443" (تحویل ترافیک به پنل Xray/Sing-Box داخل خود سرور خارج)
-target_upstream = "127.0.0.1:8443"
+[[client.remotes]]
+name = "node-cloudflare"
+addr = "198.51.100.25:443"
+sni = "www.speedtest.net"
+host = "app.yourdomain.com"
+
+[[client.remotes]]
+name = "node-direct"
+addr = "198.51.100.26:443"
+sni = "app2.yourdomain.com"
+host = "app2.yourdomain.com"

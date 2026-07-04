@@ -37,10 +37,12 @@ async fn main() {
     let token = current_cancel_token.clone();
     let cfg_initial = initial_config.clone();
     tokio::spawn(async move {
-        if cfg_initial.mode == "server" {
-            run_server(cfg_initial.server.unwrap(), token).await;
+        if let Some(server_cfg) = cfg_initial.server {
+            run_server(server_cfg, token).await;
+        } else if let Some(client_cfg) = cfg_initial.client {
+            run_client(client_cfg, token).await;
         } else {
-            run_client(cfg_initial.client.unwrap(), token).await;
+            error!("❌ Invalid config: Neither [server] nor [client] block found.");
         }
     });
 
@@ -59,10 +61,10 @@ async fn main() {
                             let token_new = current_cancel_token.clone();
 
                             tokio::spawn(async move {
-                                if new_config.mode == "server" {
-                                    run_server(new_config.server.unwrap(), token_new).await;
-                                } else {
-                                    run_client(new_config.client.unwrap(), token_new).await;
+                                if let Some(server_cfg) = new_config.server {
+                                    run_server(server_cfg, token_new).await;
+                                } else if let Some(client_cfg) = new_config.client {
+                                    run_client(client_cfg, token_new).await;
                                 }
                             });
                             info!("✅ Reload successful. New settings applied.");

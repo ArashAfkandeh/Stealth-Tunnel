@@ -7,7 +7,6 @@ use std::collections::HashMap;
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct AppConfig {
-    pub mode: String,
     pub log_level: Option<String>,
     pub server: Option<ServerConfig>,
     pub client: Option<ClientConfig>,
@@ -26,8 +25,12 @@ pub struct ServerConfig {
 #[derive(Deserialize, Debug, Clone)]
 pub struct RemoteNode {
     pub addr: String,
-    pub domain: String, // ادغام sni و host به یک کلید برای سادگی پشت کلودفلر
+    pub sni: String,
+    pub host: String,
+    pub protocol: Option<String>, // "h2" or "quic"
 }
+
+fn default_pool_size() -> usize { 5 }
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct ClientConfig {
@@ -35,7 +38,8 @@ pub struct ClientConfig {
     pub remotes: Vec<RemoteNode>,
     pub hidden_path: String,
     pub secret: String,
-    pub pool_size_per_node: Option<usize>,
+    #[serde(default = "default_pool_size")]
+    pub pool_size_per_node: usize,
 }
 
 #[derive(Debug, Clone, Default)]
