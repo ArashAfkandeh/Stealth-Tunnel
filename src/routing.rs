@@ -4,16 +4,17 @@ use std::{collections::HashMap, net::IpAddr};
 // ==========================================
 // 3. SMART PORT MAPPING & SNI ROUTING
 // ==========================================
-pub fn parse_port_mappings(mappings: &[String]) -> HashMap<String, Route> {
-    let mut routes: HashMap<String, Route> = HashMap::new();
-
+pub fn parse_port_mappings(mappings: &[String], location: Option<&str>, routes: &mut HashMap<String, Route>) {
     for m in mappings {
-        let parts: Vec<&str> = m.splitn(2, '=').collect();
-        if parts.len() != 2 { continue; }
-
-        let left = parts[0];
-        let right = parts[1].to_string();
-        let left_parts: Vec<&str> = left.rsplitn(2, ':').collect();
+        let (left, right) = if let Some(idx) = m.find('=') {
+            (&m[..idx], &m[idx+1..])
+        } else if let Some(idx) = m.rfind(':') {
+            (&m[..idx], &m[idx+1..])
+        } else {
+            continue;
+        };
+        let right = right.trim().to_string();
+        let left_parts: Vec<&str> = left.trim().rsplitn(2, ':').collect();
         let port_str = left_parts[0];
 
         let mut bind_ip = "0.0.0.0".to_string();
@@ -32,12 +33,14 @@ pub fn parse_port_mappings(mappings: &[String]) -> HashMap<String, Route> {
         let route = routes.entry(bind_addr).or_default();
 
         if let Some(sni) = sni_rule {
-            route.sni_rules.insert(sni, right);
+            route.sni_rules.insert(sni, right.clone());
         } else {
-            route.default_upstream = Some(right);
+            route.default_upstream = Some(right.clone());
+        }
+        if let Some(loc) = location {
+            route.target_locations.insert(right, loc.to_string());
         }
     }
-    routes
 }
 
 // استخراج SNI از داخل پکت‌های خام TLS (بدون دستکاری پکت)

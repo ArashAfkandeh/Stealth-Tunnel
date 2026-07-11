@@ -1,45 +1,58 @@
 #!/bin/bash
+# GhostRPC Auto Build Script
+
 set -e
-echo "🚀 Starting Enterprise Build Process (Native/Dynamic GNU)..."
 
-# وارد شدن به پوشه صحیح پروژه (جلوگیری از اجرای نسخه قبلی اسکریپت)
-cd "$(dirname "$0")"
+echo "==========================================="
+echo "   GhostRPC Auto Build Script              "
+echo "==========================================="
 
-# 1. نصب پیش‌نیازهای کامپایل BoringSSL روی لینوکس استاندارد (Glibc)
+# 1. Update and install basic dependencies
+echo "[*] Checking and installing basic build dependencies..."
 if command -v apt-get &> /dev/null; then
-    echo "🔧 Installing native build dependencies (g++, cmake, golang, etc.)..."
-    apt-get update
-    # نصب نسخه‌های استاندارد ابزارهای کامپایل به جای musl
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -q -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" build-essential cmake golang clang pkg-config libssl-dev g++ git ninja-build curl
+    sudo apt-get update -y
+    sudo apt-get install -y curl build-essential pkg-config libssl-dev
+elif command -v yum &> /dev/null; then
+    sudo yum update -y
+    sudo yum groupinstall -y "Development Tools"
+    sudo yum install -y curl openssl-devel
 elif command -v dnf &> /dev/null; then
-    echo "🔧 Installing native build dependencies (gcc-c++, cmake, golang, etc.)..."
-    dnf install -y gcc-c++ cmake golang clang pkgconf-pkg-config openssl-devel git ninja-build curl
+    sudo dnf update -y
+    sudo dnf groupinstall -y "Development Tools"
+    sudo dnf install -y curl openssl-devel
 elif command -v pacman &> /dev/null; then
-    echo "🔧 Installing native build dependencies for Arch Linux..."
-    pacman -Sy --noconfirm base-devel cmake go clang pkgconf openssl git ninja curl
+    sudo pacman -Sy --noconfirm base-devel curl openssl
+else
+    echo "[!] Unsupported package manager. Please install build essentials and OpenSSL manually."
 fi
 
-# 2. بررسی و نصب خودکار Rust
+# 2. Check and install Rust/Cargo
 if ! command -v cargo &> /dev/null; then
-    if [ -f "$HOME/.cargo/env" ]; then
-        source "$HOME/.cargo/env" || . "$HOME/.cargo/env"
-    else
-        echo "🦀 Cargo is missing. Installing Rust automatically..."
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-        source "$HOME/.cargo/env" || . "$HOME/.cargo/env"
-    fi
+    echo "[*] Rust (Cargo) is not installed. Installing Rust..."
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    
+    # Source the environment variables for the current session
+    export PATH="$HOME/.cargo/bin:$PATH"
+    echo "[*] Rust has been successfully installed."
+else
+    echo "[*] Rust is already installed: $(cargo --version)"
 fi
 
-# 3. کامپایل نسخه Release (حذف تارگت musl برای حل مشکل boring-sys)
-# توجه: به دلیل پیچیدگی‌های BoringSSL، بیلد به صورت داینامیک روی لینوکس انجام می‌شود.
-echo "⚙️ Building the binary natively (This may take a few minutes)..."
-cargo build --release
+# 3. Build the project
+echo "[*] Building GhostRPC for release..."
+# Ensure we are in the directory containing Cargo.toml
+if [ ! -f "Cargo.toml" ]; then
+    echo "[!] Cargo.toml not found in the current directory! Please run this script from the root of the project."
+    exit 1
+fi
 
-# 4. استخراج و فشرده‌سازی باینری
-echo "📂 Moving and stripping the binary..."
-mkdir -p ./release_bin
-cp target/release/stealth_tunnel ./release_bin/
-strip ./release_bin/stealth_tunnel || true # کاهش حجم فایل خروجی
-
+RUSTFLAGS="-C target-cpu=generic" CARGO_TARGET_DIR=/root/target cargo build --release
+cp /root/target/release/GhostRPC ./GhostRPC
 echo "✅ Build Completed Successfully!"
-echo "📁 Binary is located at: ./release_bin/stealth_tunnel"
+echo ""
+echo "[*] Quick Instructions:"
+echo "    Server Mode: ./GhostRPC server.toml"
+echo "    Client Mode: ./GhostRPC client.toml"
+echo ""
+echo "[+] The executable is located at: ./GhostRPC"
+echo "==========================================="

@@ -1,64 +1,9 @@
-use bytes::Bytes;
-use rand::Rng;
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, SignatureScheme};
+
+
 use socket2::{SockRef, TcpKeepalive};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tracing::warn;
-
-/// Verifier سهل‌گیر برای مسیر QUIC/H3: زنجیره‌ی گواهی سرور را بررسی نمی‌کند
-/// چون سرور REALITY (برای کلاینت‌های مجاز) یک گواهی موقت خودامضا ارائه
-/// می‌دهد. اعتماد واقعی روی AEAD مشترک (secret) است، نه روی PKI عمومی.
-#[derive(Debug)]
-pub struct NoCertVerification;
-
-impl ServerCertVerifier for NoCertVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::ECDSA_NISTP521_SHA512,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::ED25519,
-        ]
-    }
-}
 
 // ==========================================
 // 2. TCP KEEPALIVE (بخشی از "2. TCP KEEPALIVE & CRYPTO")
@@ -72,37 +17,45 @@ pub fn enable_tcp_keepalive(stream: &TcpStream) {
     }
 }
 
-pub fn frame_grpc(data: &[u8]) -> Bytes {
-    let mut buf = crate::buf_pool::PooledVec::new();
-    buf.push(0);
-    buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    buf.extend_from_slice(data);
-    Bytes::copy_from_slice(&buf)
+pub fn tune_socket_buffers(stream: &TcpStream) {
+    // Only keeping socket reference for future tuning if needed.
+    // Explicit SO_RCVBUF and SO_SNDBUF removed to allow Linux TCP Auto-Tuning.
+    let _sock = SockRef::from(stream);
 }
 
-/// یک گواهی خود-امضا (Self-Signed) و کلید خصوصی موقت و صرفاً در حافظه
-/// می‌سازد. سرور دیگر نیازی به گواهی واقعیِ سایت هدف (یا هیچ گواهی روی
-/// دیسک) ندارد؛ این گواهی فقط برای کلاینت‌هایی که از قبل از طریق کانال
-/// SNI/HMAC احراز هویت شده‌اند به‌کار می‌رود و چون آن کلاینت‌ها اعتبارسنجی
-/// زنجیره‌ی گواهی را عمداً غیرفعال کرده‌اند (امنیت واقعی از AEAD مشترک
-/// تامین می‌شود، نه از PKI)، خود-امضا بودن آن مشکلی ایجاد نمی‌کند.
-pub fn generate_ephemeral_cert() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
-    let subject_alt_names = vec!["localhost".to_string()];
-    let cert_key = rcgen::generate_simple_self_signed(subject_alt_names)
-        .expect("Failed to generate ephemeral REALITY certificate");
-
-    let cert_der = CertificateDer::from(cert_key.cert.der().to_vec());
-    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert_key.key_pair.serialize_der()));
-
-    (vec![cert_der], key_der)
+#[cfg(target_os = "linux")]
+pub fn enable_tcp_bbr(stream: &TcpStream) {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let bbr = b"bbr\0";
+    unsafe {
+        let res = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_CONGESTION,
+            bbr.as_ptr() as *const _,
+            (bbr.len() - 1) as libc::socklen_t, // pass length without null terminator or with? Wait, usually we pass the string length, e.g. 3 for "bbr"
+        );
+        if res != 0 {
+            warn!("Failed to set TCP BBR. Is it enabled in the kernel?");
+        }
+    }
 }
+
+#[cfg(not(target_os = "linux"))]
+pub fn enable_tcp_bbr(_stream: &TcpStream) {
+    // BBR setting is Linux-specific
+}
+
+
 
 pub fn get_random_headers() -> Vec<(&'static str, &'static str)> {
     let user_agents = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
     ];
-    let ua = user_agents[rand::thread_rng().gen_range(0..user_agents.len())];
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let ua = user_agents[(now % user_agents.len() as u128) as usize];
     vec![
         ("user-agent", ua),
         ("accept", "application/grpc-web, application/grpc, */*"),
@@ -110,4 +63,49 @@ pub fn get_random_headers() -> Vec<(&'static str, &'static str)> {
         ("te", "trailers"),
         ("content-type", "application/grpc"),
     ]
+}
+
+pub fn create_reuseport_listener(addr_str: &str) -> std::io::Result<tokio::net::TcpListener> {
+    use socket2::{Socket, Domain, Type, Protocol};
+    use std::net::SocketAddr;
+    
+    let addr: SocketAddr = addr_str.parse().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let domain = if addr.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    
+    socket.set_reuse_address(true)?;
+    
+    #[cfg(target_family = "unix")]
+    if let Err(e) = socket.set_reuse_port(true) {
+        tracing::warn!("Failed to set SO_REUSEPORT (Hot-reload might drop connections during restart): {}", e);
+    }
+    
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?; // backlog of 1024
+    
+    let std_listener: std::net::TcpListener = socket.into();
+    std_listener.set_nonblocking(true)?;
+    tokio::net::TcpListener::from_std(std_listener)
+}
+
+pub fn create_reuseport_udp_socket(addr_str: &str) -> std::io::Result<tokio::net::UdpSocket> {
+    use socket2::{Socket, Domain, Type, Protocol};
+    use std::net::SocketAddr;
+    
+    let addr: SocketAddr = addr_str.parse().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let domain = if addr.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    
+    socket.set_reuse_address(true)?;
+    
+    #[cfg(target_family = "unix")]
+    if let Err(e) = socket.set_reuse_port(true) {
+        tracing::warn!("Failed to set SO_REUSEPORT on UDP (Hot-reload might fail): {}", e);
+    }
+    
+    socket.bind(&addr.into())?;
+    socket.set_nonblocking(true)?;
+    
+    let std_socket: std::net::UdpSocket = socket.into();
+    tokio::net::UdpSocket::from_std(std_socket)
 }

@@ -1,12 +1,41 @@
 [server]
+
+# آدرس و پورتی که سرور روی آن گوش می‌دهد
 bind_addr = "0.0.0.0:443"
-secret = "My_Super_Enterprise_Secret_Key_2026!"
+
+# رمز عبور مشترک بین سرور و کلاینت برای احراز هویت
+secret = "my_super_secret_password"
+
+# مسیر مخفی برای درخواست‌های تونل (باید با کلاینت یکی باشد)
 hidden_path = "/api/v4/telemetry"
-# دیگر نیازی به tls_cert/tls_key نیست — سرور یک گواهی موقت داخلی می‌سازد.
-# این دامنه باید دقیقاً همان چیزی باشد که در client.toml روی هر remote به
-# صورت `sni = "..."` تنظیم شده (بدون ساب‌دامین HMAC؛ آن بخش پویا اضافه می‌شود).
-camouflage_domain = "www.ubuntu.com"
-# آدرس IP:Port واقعیِ همان دامنه که ترافیک غیرمجاز/اسکنرها به صورت خام
-# (Layer-4 Splice) به آن هدایت می‌شود. برای دقت بیشتر از یک IP ثابت به‌جای
-# نام دامنه استفاده کنید تا هیچ DNS Lookup اضافه‌ای در مسیر بحرانی نباشد.
-reality_target_addr = "185.125.190.20:443"
+
+# مسیر فایل‌های گواهینامه TLS (برای ارتباط امن H2/HTTPS)
+tls_cert = "fullchain.pem"
+tls_key = "privkey.pem"
+
+# هدف استتار (Active Probing Defense) - می‌تواند سایت یا مسیر فایل محلی باشد
+camouflage_target = "https://www.ubuntu.com"
+
+# تنظیمات دریافت خودکار گواهینامه Let's Encrypt (DNS-01 Challenge)
+cloudflare_api_token = "YOUR_CLOUDFLARE_API_TOKEN"
+
+acme_domains = [
+    "domain.com",
+    "*.domain.com"
+]
+
+# (اختیاری) سطح لاگ‌گیری سیستم: "trace", "debug", "info", "warn", "error"
+log_level = "info"
+
+# تنظیمات مسیریابی فوق‌سریع ترافیک بر اساس دامنه (SNI Routing)
+# در این بخش می‌توانید تعیین کنید که اگر کلاینت با یکی از دامنه‌های زیر به سرور متصل شد،
+# ترافیک آن بدون بازگشایی رمزنگاری (Zero-Copy) مستقیماً به آی‌پی و پورت مشخص شده (مثلاً سرور Xray) هدایت شود.
+# فرمت: "دامنه:پورت_ورودی=آی‌پی_مقصد:پورت_مقصد"
+port_mappings = [
+    "fi.SNI.COM:443=127.0.0.2:443",
+    "fr.SNI.COM:443=127.0.0.2:443",
+    "tr.SNI.COM:443=127.0.0.2:443",
+    "de.SNI.COM:443=127.0.0.2:443",
+    "nl.SNI.COM:443=127.0.0.2:443",
+    "uk.SNI.COM:443=127.0.0.2:443",
+]

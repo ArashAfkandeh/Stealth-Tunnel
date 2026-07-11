@@ -15,43 +15,36 @@ pub struct AppConfig {
 #[derive(Deserialize, Debug, Clone)]
 pub struct ServerConfig {
     pub bind_addr: String,
-    pub secret: String,
     pub hidden_path: String,
-    // این دامنه‌ی پوششی (مثلاً "www.ubuntu.com") همانی است که ترافیک
-    // غیرمجاز/اسکنرها به صورت خام (Layer-4 Splice) به آن هدایت می‌شوند.
-    pub camouflage_domain: Option<String>,
-    // آدرس IP:Port واقعی سرور هدف که در صورت عدم احراز هویت، اتصال TCP
-    // به صورت کاملاً خام (بدون دخالت در محتوا) به آن Forward می‌شود.
-    pub reality_target_addr: Option<String>,
-    
-    // فیلدهای قدیمی جهت سازگاری با نسخه‌های قبل
-    pub tls_cert: Option<String>,
-    pub tls_key: Option<String>,
-    pub reality_fallback_url: Option<String>,
+    pub tls_cert: String,
+    pub tls_key: String,
+    pub port_mappings: Option<Vec<String>>,
+    pub camouflage_target: Option<String>,
+    pub cloudflare_api_token: Option<String>,
+    pub acme_domains: Option<Vec<String>>,
+    pub secret: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
-pub struct RemoteNode {
-    pub addr: String,
-    pub sni: String,
-    pub host: String,
-    pub protocol: Option<String>, // "h2" or "quic"
+pub struct RemoteLocation {
+    pub location: String,
+    pub sni: Vec<String>,
+    pub port_mappings: Vec<String>,
 }
-
-fn default_pool_size() -> usize { 5 }
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct ClientConfig {
-    pub port_mappings: Vec<String>,
-    pub remotes: Vec<RemoteNode>,
+    pub clean_ip: Vec<String>,
+    pub remotes: Vec<RemoteLocation>,
     pub hidden_path: String,
-    pub secret: String,
-    #[serde(default = "default_pool_size")]
-    pub pool_size_per_node: usize,
+    pub pool_size_per_node: Option<usize>,
+    pub accept_udp: Option<String>,
+    pub secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct Route {
+    pub target_locations: HashMap<String, String>,
     pub default_upstream: Option<String>,
     pub sni_rules: HashMap<String, String>,
 }

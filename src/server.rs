@@ -1,224 +1,59 @@
 use crate::config::ServerConfig;
-use crate::crypto::{decrypt_payload, derive_cipher, encrypt_payload, is_authorized_sni};
-use crate::net_utils::{enable_tcp_keepalive, frame_grpc, generate_ephemeral_cert, get_random_headers};
-use crate::routing::extract_sni;
 
-use rand::Rng;
+use crate::net_utils::{enable_tcp_keepalive, get_random_headers};
+
+use bytes::{Bytes, BytesMut};
 use http::StatusCode;
-use quinn::{ServerConfig as QuinnServerConfig, Endpoint};
-use std::{sync::Arc, time::Duration};
+use std::{fs, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::info;
 
-use std::net::IpAddr;
-use std::collections::HashMap;
-use tokio::sync::RwLock;
-
-// حداکثر بایتی که برای استخراج ClientHello/SNI با peek() بررسی می‌شود
-const PEEK_BUF_SIZE: usize = 8192;
-// حداکثر زمان انتظار برای رسیدن کامل ClientHello (میلی‌ثانیه)
-const PEEK_TIMEOUT_MS: u64 = 400;
-
-/// بدون این‌که حتی یک بایت از سوکت مصرف (Consume) شود، منتظر می‌ماند تا
-/// ClientHello کامل برسد و SNI آن را استخراج می‌کند. چون از peek() استفاده
-/// می‌شود، بایت‌ها همچنان در بافر کرنل باقی می‌مانند و چه مسیر Splice خام
-/// و چه مسیر TLS Terminate محلی انتخاب شود، همان جریان اصلی TCP بدون هیچ
-/// کپی/بازپخش دستی مصرف خواهد شد.
-async fn peek_sni(tcp: &TcpStream) -> Option<String> {
-    let mut buf = crate::buf_pool::PooledVec::new_with_size(PEEK_BUF_SIZE);
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(PEEK_TIMEOUT_MS);
-    loop {
-        if let Ok(n) = tcp.peek(&mut buf).await {
-            if n > 0 {
-                if let Some(sni) = extract_sni(&buf[..n]) {
-                    return Some(sni);
-                }
-            }
-        }
-        if tokio::time::Instant::now() >= deadline { return None; }
-        tokio::time::sleep(Duration::from_millis(15)).await;
-    }
-}
-
-/// مسیر عدم-احراز-هویت: اتصال TCP به صورت کاملاً خام (Layer-4) به سرور هدف
-/// واقعی وصل و بدون هیچ دخالتی Splice می‌شود. از آن‌جا که هیچ داده‌ای رمزگشایی،
-/// بازتولید یا Fetch نمی‌شود، سرعت و هدرها دقیقاً همان سرور هدف واقعی است؛
-/// نه تاخیر Fetch-and-Serve وجود دارد و نه امکان نشت هدر.
-async fn splice_to_real_target(mut client_tcp: TcpStream, target_addr: &str) {
-    match TcpStream::connect(target_addr).await {
-        Ok(mut target_tcp) => {
-            let _ = target_tcp.set_nodelay(true);
-            enable_tcp_keepalive(&target_tcp);
-            if let Err(e) = tokio::io::copy_bidirectional(&mut client_tcp, &mut target_tcp).await {
-                debug!("Splice session ended: {}", e);
-            }
-        }
-        Err(e) => {
-            warn!("⚠️ Could not reach reality_target_addr ({}): {} — dropping connection", target_addr, e);
-        }
-    }
-}
-
+// ==========================================
+// 6. SERVER MODE
+// ==========================================
 pub async fn run_server(cfg: ServerConfig, cancel_token: CancellationToken) {
-    let cipher = Arc::new(derive_cipher(&cfg.secret));
-    let authorized_ips: Arc<RwLock<HashMap<IpAddr, tokio::time::Instant>>> = Arc::new(RwLock::new(HashMap::new()));
-
-    // ============================
-    // گواهی موقت (Ephemeral Self-Signed Certificate)
-    // ----------------------------
-    // دیگر نیازی به tls_cert/tls_key واقعی روی دیسک نیست. این سرتیفیکیت فقط
-    // برای کلاینت‌های خودمان (که از قبل با HMAC بر پایه‌ی SNI احراز هویت
-    // شده‌اند و اعتبارسنجی زنجیره‌ی گواهی را در سمت کلاینت خاموش کرده‌اند)
-    // استفاده می‌شود؛ نه برای کاربران/اسکنرهایی که هرگز به این مرحله نمی‌رسند.
-    // ============================
-    let (certs, key_tcp, key_quic) = if let (Some(cert_path), Some(key_path)) = (&cfg.tls_cert, &cfg.tls_key) {
-        let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(cert_path).unwrap())).map(|r| r.unwrap()).collect();
-        let key_bytes = rustls_pemfile::pkcs8_private_keys(&mut std::io::BufReader::new(std::fs::File::open(key_path).unwrap())).next().unwrap().unwrap();
-        (certs, rustls::pki_types::PrivateKeyDer::Pkcs8(key_bytes.clone_key()), rustls::pki_types::PrivateKeyDer::Pkcs8(key_bytes))
-    } else {
-        let (c, k1) = generate_ephemeral_cert();
-        let (_, k2) = generate_ephemeral_cert();
-        (c, k1, k2)
+    let cert_file = match fs::File::open(&cfg.tls_cert) {
+        Ok(f) => f,
+        Err(_) => {
+            tracing::error!("❌ گواهینامه TLS پیدا نشد!");
+            tracing::error!("مسیر جستجو: {}", cfg.tls_cert);
+            tracing::error!("اگر از توکن Cloudflare استفاده نمی‌کنید، باید گواهینامه‌های خود را به صورت دستی در این مسیر قرار دهید.");
+            tracing::error!("برنامه متوقف شد.");
+            std::process::exit(1);
+        }
     };
     
+    let key_file = match fs::File::open(&cfg.tls_key) {
+        Ok(f) => f,
+        Err(_) => {
+            tracing::error!("❌ فایل کلید خصوصی (Private Key) پیدا نشد!");
+            tracing::error!("مسیر جستجو: {}", cfg.tls_key);
+            tracing::error!("برنامه متوقف شد.");
+            std::process::exit(1);
+        }
+    };
 
-    // ============================
-    // 1. TCP Server (H2 Tunneling)
-    // ============================
+    let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(cert_file)).map(|r| r.unwrap()).collect();
+    let key = rustls_pemfile::pkcs8_private_keys(&mut std::io::BufReader::new(key_file)).next().unwrap().unwrap();
+
     let mut tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(certs.clone(), key_tcp)
+        .with_single_cert(certs, rustls::pki_types::PrivateKeyDer::Pkcs8(key))
         .unwrap();
-    tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    tls_config.alpn_protocols = vec![b"h2".to_vec()];
 
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
-    let listener = TcpListener::bind(&cfg.bind_addr).await.unwrap();
+    let listener = crate::net_utils::create_reuseport_listener(&cfg.bind_addr).unwrap();
+    info!("🛡️ Server listening on {}", cfg.bind_addr);
     
-    // ============================
-    // 2. UDP Server (QUIC Tunneling with User-Space NAT Proxy)
-    // ============================
-    let mut quic_crypto = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key_quic)
-        .unwrap();
-    quic_crypto.alpn_protocols = vec![b"h3".to_vec()]; // تظاهر به HTTP/3 برای فرار از سیستم فیلترینگ
-    
-    let quic_config = QuinnServerConfig::with_crypto(Arc::new(quinn::crypto::rustls::QuicServerConfig::try_from(quic_crypto).unwrap()));
-    // بایند کردن quinn به یک پورت لوکال تصادفی
-    let local_quic_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let quic_endpoint = Endpoint::server(quic_config, local_quic_addr).unwrap();
-    let actual_local_quic_addr = quic_endpoint.local_addr().unwrap();
+    let mut route_table = std::collections::HashMap::new();
+    crate::routing::parse_port_mappings(cfg.port_mappings.as_ref().unwrap_or(&vec![]), None, &mut route_table);
+    let local_route = Arc::new(route_table.get(&cfg.bind_addr).cloned().unwrap_or_default());
 
-    let fallback_camo = cfg.reality_fallback_url.as_deref()
-        .and_then(|u| u.trim_start_matches("https://").trim_start_matches("http://").split('/').next())
-        .unwrap_or("www.ubuntu.com");
-    let print_target = cfg.reality_target_addr.as_deref().unwrap_or(fallback_camo);
-    let reality_target_addr = cfg.reality_target_addr.clone().unwrap_or_else(|| format!("{}:443", print_target));
-    
-    info!("🛡️ TCP & QUIC (UDP) Server listening concurrently on {} (REALITY-style L4 splice active, target={})", cfg.bind_addr, print_target);
-    info!("ℹ️ UDP/QUIC traffic is now protected by TCP-first IP Authorization & User-Space NAT Proxy.");
-
-    // اسپاون کردن پراکسی UDP
-    let udp_bind_addr = cfg.bind_addr.clone();
-    let udp_auth_ips = authorized_ips.clone();
-    let udp_cancel_token = cancel_token.clone();
-    let udp_reality_target = reality_target_addr.clone();
-    
-    tokio::spawn(async move {
-        crate::udp_proxy::run_udp_proxy(
-            udp_bind_addr,
-            actual_local_quic_addr,
-            udp_reality_target,
-            udp_auth_ips,
-            udp_cancel_token,
-        ).await;
-    });
-
-    // اسپاون کردن روتین QUIC (کاملاً مستقل از TCP)
-    let cancel_quic = cancel_token.clone();
-    let cipher_quic = cipher.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = cancel_quic.cancelled() => break,
-                Some(conn) = quic_endpoint.accept() => {
-                    let cipher_in = cipher_quic.clone();
-                    let cipher_out = cipher_quic.clone();
-                    tokio::spawn(async move {
-                        if let Ok(connection) = conn.await {
-                            while let Ok((mut send_stream, mut recv_stream)) = connection.accept_bi().await {
-                                let cipher_in = cipher_in.clone();
-                                let cipher_out = cipher_out.clone();
-                                tokio::spawn(async move {
-                                    // پردازش هدر امن برای QUIC (استخراج آدرس مقصد)
-                                    let mut head = [0u8; 5];
-                                    if recv_stream.read_exact(&mut head).await.is_err() { return; }
-                                    let len = u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
-                                    if len > 8192 { return; }
-                                    let mut payload = crate::buf_pool::PooledVec::new_with_size(len);
-                                    if recv_stream.read_exact(&mut payload).await.is_err() { return; }
-                                    
-                                    let dec = match decrypt_payload(&cipher_in, &payload) {
-                                        Ok(d) => d,
-                                        Err(_) => return,
-                                    };
-                                    if dec.is_empty() { return; }
-                                    let target_len = dec[0] as usize;
-                                    if dec.len() < 1 + target_len { return; }
-                                    let target = String::from_utf8_lossy(&dec[1..1+target_len]).to_string();
-                                    
-                                    if let Ok(target_tcp) = tokio::net::TcpStream::connect(&target).await {
-                                        let _ = target_tcp.set_nodelay(true);
-                                        enable_tcp_keepalive(&target_tcp);
-                                        let (mut target_read, mut target_write) = target_tcp.into_split();
-                                        
-                                        tokio::spawn(async move {
-                                            let mut buf = crate::buf_pool::PooledVec::new_with_size(8192);
-                                            loop {
-                                                let timeout_dur = std::time::Duration::from_millis(rand::thread_rng().gen_range(20..50));
-                                                match tokio::time::timeout(timeout_dur, target_read.read(&mut buf)).await {
-                                                    Ok(Ok(0)) => break,
-                                                    Ok(Ok(n)) => {
-                                                        let framed = frame_grpc(&encrypt_payload(&cipher_out, &buf[..n]));
-                                                        if send_stream.write_all(&framed).await.is_err() { break; }
-                                                    }
-                                                    Ok(Err(_)) => break,
-                                                    Err(_) => {
-                                                        // Timeout -> Send Dummy Packet
-                                                        let framed = frame_grpc(&encrypt_payload(&cipher_out, &[]));
-                                                        if send_stream.write_all(&framed).await.is_err() { break; }
-                                                    }
-                                                }
-                                            }
-                                        });
-                                        
-                                        let mut grpc_buf = crate::buf_pool::PooledVec::new();
-                                        while let Ok(Some(chunk)) = recv_stream.read_chunk(usize::MAX, true).await {
-                                            grpc_buf.extend_from_slice(&chunk.bytes);
-                                            while grpc_buf.len() >= 5 {
-                                                let len = u32::from_be_bytes([grpc_buf[1], grpc_buf[2], grpc_buf[3], grpc_buf[4]]) as usize;
-                                                if grpc_buf.len() < 5 + len { break; }
-                                                if let Ok(dec) = decrypt_payload(&cipher_in, &grpc_buf[5..5+len]) {
-                                                    if target_write.write_all(&dec).await.is_err() { break; }
-                                                }
-                                                grpc_buf.drain(0..5+len);
-                                            }
-                                        }
-                                    }
-                                });
-                            }
-                        }
-                    });
-                }
-            }
-        }
-    });
-
-    // حلقه اصلی پردازش TCP (H2)
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => {
@@ -226,122 +61,306 @@ pub async fn run_server(cfg: ServerConfig, cancel_token: CancellationToken) {
                 break;
             }
             accept_res = listener.accept() => {
-                if let Ok((tcp, peer)) = accept_res {
+                if let Ok((mut tcp, peer)) = accept_res {
+                    tracing::debug!("🔗 Accepted TCP connection from {}", peer);
                     let _ = tcp.set_nodelay(true);
+                    crate::net_utils::enable_tcp_bbr(&tcp);
+                    crate::net_utils::tune_socket_buffers(&tcp);
                     enable_tcp_keepalive(&tcp);
 
                     let acceptor = acceptor.clone();
                     let cfg_path = cfg.hidden_path.clone();
+                    let cfg_camo = cfg.camouflage_target.clone();
                     let cfg_secret = cfg.secret.clone();
-                    let cfg_camo_domain = cfg.camouflage_domain.clone().unwrap_or_else(|| {
-                        cfg.reality_fallback_url.as_deref()
-                            .and_then(|u| u.trim_start_matches("https://").trim_start_matches("http://").split('/').next())
-                            .unwrap_or("www.ubuntu.com")
-                            .to_string()
-                    });
-                    let cfg_target_addr = cfg.reality_target_addr.clone().unwrap_or_else(|| {
-                        format!("{}:443", cfg_camo_domain)
-                    });
-                    let cipher_in = cipher.clone();
-                    let cipher_out = cipher.clone();
-                    let authorized_ips = authorized_ips.clone();
+                    let route = local_route.clone();
 
                     tokio::spawn(async move {
-                        // ==========================================
-                        // REALITY-STYLE GATE (لایه ۴/۵.۵)
-                        // ------------------------------------------
-                        // پیش از هرگونه Handshake واقعی TLS، فقط با peek()
-                        // (بدون مصرف بایت) هویت کلاینت از روی SNI بررسی می‌شود.
-                        // - کلاینت اصیل ⇒ Handshake محلی با گواهی موقت.
-                        // - هرچیز دیگر (اسکنر Active Prober، مرورگر واقعی،
-                        //   بایت‌های ناقص/غیر-TLS) ⇒ Splice خام لایه ۴ به
-                        //   سرور هدف واقعی؛ صفر پردازش، صفر تاخیر اضافه،
-                        //   صفر امکان نشت هدر.
-                        // ==========================================
-                        let sni = peek_sni(&tcp).await;
-                        let authorized = sni.as_deref()
-                            .map(|s| is_authorized_sni(s, &cfg_secret, &cfg_camo_domain))
-                            .unwrap_or(false);
+                        let mut initial_buf = [0u8; 2048];
+                        let mut initial_len = 0;
+                        let mut extracted_sni = None;
+                        
+                        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+                            loop {
+                                if initial_len >= 2048 { break; }
+                                let n = match tcp.read(&mut initial_buf[initial_len..]).await {
+                                    Ok(n) if n > 0 => n,
+                                    _ => break,
+                                };
+                                initial_len += n;
 
-                        if !authorized {
-                            debug!("[{}] Unauthorized/foreign ClientHello (sni={:?}) → raw L4 splice to {}", peer, sni, cfg_target_addr);
-                            splice_to_real_target(tcp, &cfg_target_addr).await;
+                                if initial_buf[0] != 0x16 { break; }
+                                if let Some(sni) = crate::routing::extract_sni(&initial_buf[..initial_len]) {
+                                    extracted_sni = Some(sni);
+                                    break;
+                                }
+
+                                if initial_len >= 5 {
+                                    let record_len = ((initial_buf[3] as usize) << 8) | (initial_buf[4] as usize);
+                                    if initial_len >= 5 + record_len {
+                                        break; 
+                                    }
+                                }
+                            }
+                        }).await;
+                        
+                        let target_up = if let Some(sni) = &extracted_sni {
+                            route.sni_rules.get(sni).cloned().or_else(|| route.default_upstream.clone())
+                        } else {
+                            route.default_upstream.clone()
+                        };
+
+                        if let Some(target) = target_up {
+                            tracing::debug!("🔄 SNI Routing triggered for {:?} -> {}", extracted_sni, target);
+                            match TcpStream::connect(&target).await {
+                                Ok(mut upstream_tcp) => {
+                                    let _ = upstream_tcp.set_nodelay(true);
+                                    crate::net_utils::tune_socket_buffers(&upstream_tcp);
+                                    crate::net_utils::enable_tcp_keepalive(&upstream_tcp);
+                                    
+                                    if initial_len > 0 {
+                                        if upstream_tcp.write_all(&initial_buf[..initial_len]).await.is_err() { return; }
+                                    }
+                                    
+                                    let _ = tokio::io::copy_bidirectional(&mut tcp, &mut upstream_tcp).await;
+                                }
+                                Err(e) => tracing::error!("Failed to connect to SNI target {}: {}", target, e),
+                            }
                             return;
                         }
 
-                        debug!("[{}] ✅ REALITY auth OK via camouflage SNI → local tunnel termination", peer);
-                        // ذخیره IP برای اجازه عبور ترافیک UDP (QUIC)
-                        authorized_ips.write().await.insert(peer.ip(), tokio::time::Instant::now());
+                        let prefixed_tcp = crate::prefixed_stream::PrefixedStream {
+                            prefix: initial_buf[..initial_len].to_vec(),
+                            inner: tcp,
+                        };
 
-                        let tls_stream = match acceptor.accept(tcp).await { Ok(s) => s, Err(_) => return };
-                        let mut h2 = match h2::server::handshake(tls_stream).await { Ok(h) => h, Err(_) => return };
+                        let tls_stream = match acceptor.accept(prefixed_tcp).await { 
+                            Ok(s) => { tracing::debug!("🔒 TLS Handshake succeeded"); s }, 
+                            Err(e) => { tracing::debug!("TLS Accept failed: {:?}", e); return } 
+                        };
+                        let mut h2 = match h2::server::Builder::new()
+                            .initial_window_size(33_554_432) // 32 MB Stream Window
+                            .initial_connection_window_size(134_217_728) // 128 MB Connection Window
+                            .max_frame_size(1_048_576) // 1 MB max frame
+                            .handshake(tls_stream).await { Ok(h) => h, Err(e) => { tracing::debug!("H2 Handshake failed: {:?}", e); return } };
 
                         while let Some(Ok((req, mut respond))) = h2.accept().await {
-                            if req.uri().path() != cfg_path {
-                                // این کلاینت از قبل در لایه SNI احراز هویت شده؛ اگر با
-                                // این‌حال مسیر درخواستش اشتباه بود، به‌جای Fetch از سایت
-                                // هدف (که یک نشتی Timing/Header دیگر می‌ساخت) فقط اتصال
-                                // بسته می‌شود.
-                                let response = http::Response::builder().status(StatusCode::NOT_FOUND).body(()).unwrap();
-                                let _ = respond.send_response(response, true);
+                            let tunnel_target = if req.uri().path() != cfg_path {
+                                None
+                            } else {
+                                let t_hdr = req.headers().get("x-tunnel-target").and_then(|h| h.to_str().ok());
+                                let s_hdr = req.headers().get("x-tunnel-secret").and_then(|h| h.to_str().ok());
+                                match (t_hdr, s_hdr) {
+                                    (Some(t_val), Some(s_val)) if s_val == cfg_secret.clone().unwrap_or_default() => Some(t_val.to_string()),
+                                    _ => {
+                                        tracing::warn!("Unauthorized or malformed request to hidden path from {}", peer);
+                                        None
+                                    }
+                                }
+                            };
+
+                            if tunnel_target.is_none() {
+                                if let Some(camo) = &cfg_camo {
+                                    if camo.starts_with("http://") || camo.starts_with("https://") {
+                                        let url = format!("{}{}", camo, req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/"));
+                                        tokio::spawn(async move {
+                                            let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+                                            match client.get(&url).send().await {
+                                                Ok(mut resp) => {
+                                                    let mut res_builder = http::Response::builder().status(resp.status());
+                                                    for (k, v) in resp.headers() {
+                                                        let k_str = k.as_str().to_lowercase();
+                                                        if k_str != "transfer-encoding" && k_str != "connection" && k_str != "content-length" {
+                                                            res_builder = res_builder.header(k.clone(), v.clone());
+                                                        }
+                                                    }
+                                                    if let Ok(mut send_stream) = respond.send_response(res_builder.body(()).unwrap(), false) {
+                                                        while let Ok(Some(chunk)) = resp.chunk().await {
+                                                            send_stream.reserve_capacity(chunk.len());
+                                                            while send_stream.capacity() < chunk.len() {
+                                                                if let Some(Err(_)) | None = std::future::poll_fn(|cx| send_stream.poll_capacity(cx)).await { break; }
+                                                            }
+                                                            if send_stream.send_data(chunk, false).is_err() { break; }
+                                                        }
+                                                        let _ = send_stream.send_data(Bytes::new(), true);
+                                                    }
+                                                }
+                                                Err(_) => {
+                                                    let _ = respond.send_response(http::Response::builder().status(404).body(()).unwrap(), true);
+                                                }
+                                            }
+                                        });
+                                    } else {
+                                        let camo_clone = camo.clone();
+                                        tokio::spawn(async move {
+                                            let mut file_path = std::path::PathBuf::from(&camo_clone);
+                                            if file_path.parent().map(|p| p.as_os_str().is_empty()).unwrap_or(true) {
+                                                let exe_dir = std::env::current_exe()
+                                                    .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default())
+                                                    .parent()
+                                                    .unwrap_or(std::path::Path::new(""))
+                                                    .to_path_buf();
+                                                file_path = exe_dir.join(&camo_clone);
+                                            }
+
+                                            if let Ok(content) = tokio::fs::read(&file_path).await {
+                                                let res = http::Response::builder()
+                                                    .status(200)
+                                                    .header("content-type", "text/html; charset=utf-8")
+                                                    .body(())
+                                                    .unwrap();
+                                                if let Ok(mut send_stream) = respond.send_response(res, false) {
+                                                    let framed = Bytes::from(content);
+                                                    send_stream.reserve_capacity(framed.len());
+                                                    while send_stream.capacity() < framed.len() {
+                                                        if let Some(Err(_)) | None = std::future::poll_fn(|cx| send_stream.poll_capacity(cx)).await { break; }
+                                                    }
+                                                    let _ = send_stream.send_data(framed, true);
+                                                }
+                                            } else {
+                                                let _ = respond.send_response(http::Response::builder().status(404).body(()).unwrap(), true);
+                                            }
+                                        });
+                                    }
+                                } else {
+                                    let _ = respond.send_response(http::Response::builder().status(404).body(()).unwrap(), true);
+                                }
                                 continue;
                             }
 
-                            let target = req.headers().get("x-tunnel-target").unwrap().to_str().unwrap().to_string();
+                            let target_val = tunnel_target.unwrap();
+                            tracing::debug!("🎯 Valid tunnel request received for target: {}", target_val);
+                            
+                            let mut target = target_val;
+                            if !target.contains(':') {
+                                target = format!("127.0.0.1:{}", target);
+                            }
+                            
                             let mut res_builder = http::Response::builder().status(StatusCode::OK);
                             for (k, v) in get_random_headers() { res_builder = res_builder.header(k, v); }
                             let mut send_stream = respond.send_response(res_builder.body(()).unwrap(), false).unwrap();
 
-                            let cipher_in = cipher_in.clone();
-                            let cipher_out = cipher_out.clone();
+
+                            let is_udp = req.headers().get("x-tunnel-protocol").map(|v| v.as_bytes() == b"udp").unwrap_or(false);
 
                             tokio::spawn(async move {
-                                if let Ok(target_tcp) = TcpStream::connect(&target).await {
-                                    let _ = target_tcp.set_nodelay(true);
-                                    enable_tcp_keepalive(&target_tcp);
-                                    let (mut target_read, mut target_write) = target_tcp.into_split();
+                                if is_udp {
+                                    let socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+                                        Ok(s) => Arc::new(s),
+                                        Err(e) => { tracing::error!("Failed to bind UDP socket: {}", e); return; }
+                                    };
+                                    let target_addr: std::net::SocketAddr = match tokio::net::lookup_host(&target).await.and_then(|mut iter| iter.next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "No IP found"))) {
+                                        Ok(a) => a,
+                                        Err(e) => { tracing::error!("Invalid UDP target addr {}: {}", target, e); return; }
+                                    };
+                                    tracing::debug!("✅ Successfully bound local UDP socket for target: {}", target);
 
+                                    let socket_recv = socket.clone();
                                     tokio::spawn(async move {
-                                        let mut buf = crate::buf_pool::PooledVec::new_with_size(8192);
+                                        let mut buf = [0u8; 65536];
                                         loop {
-                                            let timeout_dur = std::time::Duration::from_millis(rand::thread_rng().gen_range(20..50));
-                                            match tokio::time::timeout(timeout_dur, target_read.read(&mut buf)).await {
-                                                Ok(Ok(0)) => break,
-                                                Ok(Ok(n)) => {
-                                                    let framed = frame_grpc(&encrypt_payload(&cipher_out, &buf[..n]));
+                                            match socket_recv.recv_from(&mut buf).await {
+                                                Ok((n, from)) if from == target_addr => {
+                                                    let mut init_buf = BytesMut::with_capacity(5 + n);
+                                                    init_buf.extend_from_slice(&[0, 0, 0, 0, 0]);
+                                                    init_buf[1..5].copy_from_slice(&(n as u32).to_be_bytes());
+                                                    init_buf.extend_from_slice(&buf[..n]);
+                                                    let framed = init_buf.freeze();
+                                                    
                                                     send_stream.reserve_capacity(framed.len());
                                                     while send_stream.capacity() < framed.len() {
                                                         if let Some(Err(_)) | None = std::future::poll_fn(|cx| send_stream.poll_capacity(cx)).await { break; }
                                                     }
-                                                    if send_stream.send_data(bytes::Bytes::copy_from_slice(&framed), false).is_err() { break; }
+                                                    if send_stream.send_data(framed, false).is_err() { break; }
                                                 }
-                                                Ok(Err(_)) => break,
-                                                Err(_) => {
-                                                    let framed = frame_grpc(&encrypt_payload(&cipher_out, &[]));
-                                                    send_stream.reserve_capacity(framed.len());
-                                                    while send_stream.capacity() < framed.len() {
-                                                        if let Some(Err(_)) | None = std::future::poll_fn(|cx| send_stream.poll_capacity(cx)).await { break; }
-                                                    }
-                                                    if send_stream.send_data(bytes::Bytes::copy_from_slice(&framed), false).is_err() { break; }
-                                                }
+                                                Ok(_) => continue,
+                                                Err(_) => break,
                                             }
                                         }
-                                        let _ = send_stream.send_data(bytes::Bytes::new(), true);
+                                        let _ = send_stream.send_data(Bytes::new(), true);
                                     });
 
-                                    let mut grpc_buf = crate::buf_pool::PooledVec::new();
+                                    let mut grpc_buf = BytesMut::new();
                                     let mut body = req.into_body();
-                                    while let Some(Ok(data)) = body.data().await {
+                                    while let Some(Ok(mut data)) = body.data().await {
                                         let _ = body.flow_control().release_capacity(data.len());
-                                        grpc_buf.extend_from_slice(&data);
-                                        while grpc_buf.len() >= 5 {
-                                            let len = u32::from_be_bytes([grpc_buf[1], grpc_buf[2], grpc_buf[3], grpc_buf[4]]) as usize;
-                                            if grpc_buf.len() < 5 + len { break; }
-                                            if let Ok(dec) = decrypt_payload(&cipher_in, &grpc_buf[5..5+len]) {
-                                                if target_write.write_all(&dec).await.is_err() { break; }
+                                        if grpc_buf.is_empty() {
+                                            while data.len() >= 5 {
+                                                let len = u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
+                                                if data.len() < 5 + len { break; }
+                                                if socket.send_to(&data[5..5+len], target_addr).await.is_err() { return; }
+                                                data = data.slice(5+len..);
                                             }
-                                            grpc_buf.drain(0..5+len);
+                                            if !data.is_empty() { grpc_buf.extend_from_slice(&data); }
+                                        } else {
+                                            grpc_buf.extend_from_slice(&data);
+                                            while grpc_buf.len() >= 5 {
+                                                let len = u32::from_be_bytes([grpc_buf[1], grpc_buf[2], grpc_buf[3], grpc_buf[4]]) as usize;
+                                                if grpc_buf.len() < 5 + len { break; }
+                                                if socket.send_to(&grpc_buf[5..5+len], target_addr).await.is_err() { return; }
+                                                let _ = grpc_buf.split_to(5 + len);
+                                            }
                                         }
+                                    }
+                                    return;
+                                }
+                                match TcpStream::connect(&target).await {
+                                    Ok(target_tcp) => {
+                                        tracing::debug!("✅ Successfully connected to local target: {}", target);
+                                        let _ = target_tcp.set_nodelay(true);
+                                        crate::net_utils::tune_socket_buffers(&target_tcp);
+                                        enable_tcp_keepalive(&target_tcp);
+                                        let (mut target_read, mut target_write) = target_tcp.into_split();
+
+                                    tokio::spawn(async move {
+                                        let mut read_buf = BytesMut::with_capacity(65536 + 5);
+                                        loop {
+                                            read_buf.clear();
+                                            read_buf.reserve(65536 + 5);
+                                            read_buf.extend_from_slice(&[0, 0, 0, 0, 0]);
+                                            let n = match target_read.read_buf(&mut read_buf).await {
+                                                Ok(0) | Err(_) => break,
+                                                Ok(n) => n,
+                                            };
+                                            read_buf[1..5].copy_from_slice(&(n as u32).to_be_bytes());
+                                            let framed = read_buf.split().freeze();
+                                            
+                                            send_stream.reserve_capacity(framed.len());
+                                            while send_stream.capacity() < framed.len() {
+                                                if let Some(Err(_)) | None = std::future::poll_fn(|cx| send_stream.poll_capacity(cx)).await { break; }
+                                            }
+                                            if send_stream.send_data(framed, false).is_err() { break; }
+                                        }
+                                        let _ = send_stream.send_data(Bytes::new(), true);
+                                    });
+
+                                    let mut grpc_buf = BytesMut::new();
+                                    let mut body = req.into_body();
+                                    while let Some(Ok(mut data)) = body.data().await {
+                                        let _ = body.flow_control().release_capacity(data.len());
+                                        
+                                        if grpc_buf.is_empty() {
+                                            while data.len() >= 5 {
+                                                let len = u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
+                                                if data.len() < 5 + len { break; }
+                                                if target_write.write_all(&data[5..5+len]).await.is_err() { return; }
+                                                data = data.slice(5+len..);
+                                            }
+                                            if !data.is_empty() {
+                                                grpc_buf.extend_from_slice(&data);
+                                            }
+                                        } else {
+                                            grpc_buf.extend_from_slice(&data);
+                                            while grpc_buf.len() >= 5 {
+                                                let len = u32::from_be_bytes([grpc_buf[1], grpc_buf[2], grpc_buf[3], grpc_buf[4]]) as usize;
+                                                if grpc_buf.len() < 5 + len { break; }
+                                                if target_write.write_all(&grpc_buf[5..5+len]).await.is_err() { return; }
+                                                let _ = grpc_buf.split_to(5 + len);
+                                            }
+                                        }
+                                    }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Failed to connect to local target {}: {}", target, e);
                                     }
                                 }
                             });

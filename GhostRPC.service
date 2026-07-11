@@ -1,0 +1,25 @@
+[Unit]
+Description=GhostRPC Tunnel Service
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+# مسیر قرارگیری باینری و فایل کانفیگ خود را متناسب با محیط خود تغییر دهید.
+# در اینجا فرض شده است فایل‌ها در پوشه /root/GhostRPC قرار دارند.
+WorkingDirectory=/root/GhostRPC
+ExecStart=/root/GhostRPC/GhostRPC /root/GhostRPC/server.toml
+Restart=always
+RestartSec=3
+
+# افزایش محدودیت‌های سیستمی برای پرفورمنس بالا در شبکه
+LimitNOFILE=1048576
+LimitNPROC=1048576
+
+# امنیت (اختیاری اما توصیه می‌شود)
+# NoNewPrivileges=true
+# ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

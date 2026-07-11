@@ -1,22 +1,44 @@
 [client]
-# بهترین مقادیر حرفه‌ای برای مخفی‌سازی شامل API‌های رایج تله‌متری و سینک است
+
+# مسیر مخفی تونل (باید دقیقا مشابه سرور باشد)
 hidden_path = "/api/v4/telemetry"
-secret = "My_Super_Enterprise_Secret_Key_2026!"
-port_mappings = [
-    "1080=127.0.0.1:8443" # هدایت ترافیک پورت 1080 به بک‌اند اصلی
+
+# رمز عبور تونل (باید دقیقا مشابه سرور باشد)
+secret = "my_super_secret_password"
+
+# (اختیاری) تعداد کانکشن‌های باز در هر نود برای اتصال سریع‌تر
+pool_size_per_node = 16
+
+# پشتیبانی بومی از UDP: اگر yes باشد، برای تمام پورت‌های مپ شده، سوکت UDP هم باز می‌شود
+accept_udp = "yes"
+
+# لیست IPهای تمیز کلودفلر (ارتباطات به صورت مسابقه‌ای و هوشمند با سریع‌ترین IP برقرار می‌شود)
+clean_ip = [
+    "104.21.32.1",
+    "172.67.19.1"
 ]
-# pool_size_per_node = 5 (پیش‌فرض 5 است در صورت عدم وجود)
 
-[[client.remotes]]
-name = "node-cloudflare"
-addr = "198.51.100.25:443"
-# باید دقیقاً برابر camouflage_domain در server.toml سرور مقصد باشد.
-# کلاینت خودش هر بار یک ساب‌دامین HMAC چرخشی جلوی آن اضافه می‌کند.
-sni = "www.ubuntu.com"
-host = "app.yourdomain.com"
+# (اختیاری) سطح لاگ‌گیری سیستم: "trace", "debug", "info", "warn", "error"
+log_level = "info"
 
+# سرورهای لوکیشن NL
 [[client.remotes]]
-name = "node-direct"
-addr = "198.51.100.26:443"
-sni = "www.ubuntu.com"
-host = "app2.yourdomain.com"
+location = "NL"
+sni = [
+    "sni1.example.com:443",
+    "sni2.example.com:443"
+]
+port_mappings = [
+    "sni.nl.example.com:443=127.0.0.1:443",
+    "1373=1373"
+]
+
+# سرورهای لوکیشن DE
+[[client.remotes]]
+location = "DE"
+sni = [
+    "sni3.example.com:443"
+]
+port_mappings = [
+    "sni.de.example.com:443=127.0.0.1:443"
+]
