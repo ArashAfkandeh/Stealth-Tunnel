@@ -116,8 +116,6 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
         return;
     }
 
-
-
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     
@@ -126,7 +124,6 @@ pub async fn run_client(cfg: ClientConfig, cancel_token: CancellationToken) {
         .with_no_client_auth();
     tls_config_h2.alpn_protocols = vec![b"h2".to_vec()];
     let tls_connector = Arc::new(TlsConnector::from(Arc::new(tls_config_h2)));
-
 
     let pool_per_node = cfg.pool_size_per_node.unwrap_or(16);
     let total_pool_size = flat_remotes.len() * pool_per_node;
